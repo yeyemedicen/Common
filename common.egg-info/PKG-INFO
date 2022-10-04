@@ -1,0 +1,24 @@
+Metadata-Version: 1.1
+Name: common
+Version: 1.0.0
+Summary: Common functions for FEniCS based solvers
+Home-page: http://gitlab.dim.uchile.cl/biomed/Common
+Author: David Nolte
+Author-email: dnolte@dim.uchile.cl
+License: MIT
+Description: # Installation
+        
+        Install with
+            $ pip install [--prefix=<prefix>/--user]
+        or
+            $ pip install -e . [--prefix=<>/--user]
+        for an editable development build (no need to reinstall package after
+        modifications).
+        This has to be done inside the (this) root directory, inside the (virtual) environment, docker container, etc., as applicable.
+        
+Platform: UNKNOWN
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python
+Classifier: Topic :: Scientific/Engineering :: Mathematics
