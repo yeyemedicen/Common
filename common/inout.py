@@ -137,14 +137,17 @@ def read_parameters(infile):
     '''
     import ruamel.yaml as yaml
     with open(infile, 'r+') as f:
-        prms = yaml.load(f, Loader=yaml.Loader)
+        yaa = yaml.YAML(typ='rt')
+        prms = yaa.load(f)
     return prms
 
 
 def dump_parameters(prms):
     ''' Wrapper for yaml.dump (e.g., for logging.debug()) '''
     import ruamel.yaml as yaml
-    return yaml.dump(prms)
+    import sys
+    yaa = yaml.YAML(typ='unsafe',pure=True)
+    return yaa.dump(prms, sys.stdout)
 
 
 def print_parameters(prms):

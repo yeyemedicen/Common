@@ -5,22 +5,22 @@ import git
 import os
 import shutil
 import dolfin
-import ufl
+#import ufl
 
 
-def is_enriched(V):
-    ''' Check if the given function space or sub function space has enriched
-    elements. '''
-
-    # FIXME pybind11 hack for >=2018.1.0:
-    if (dolfin.__version__ >= '2018'
-            and isinstance(V, dolfin.cpp.function.FunctionSpace)):
-        V = dolfin.FunctionSpace(V)
-
-    while V.num_sub_spaces():
-        V = V.sub(0)
-    return isinstance(V.ufl_element(),
-                      ufl.finiteelement.enrichedelement.EnrichedElement)
+#def is_enriched(V):
+#    ''' Check if the given function space or sub function space has enriched
+#    elements. '''
+#
+#    # FIXME pybind11 hack for >=2018.1.0:
+#    if (dolfin.__version__ >= '2018'
+#            and isinstance(V, dolfin.cpp.function.FunctionSpace)):
+#        V = dolfin.FunctionSpace(V)
+#
+#    while V.num_sub_spaces():
+#        V = V.sub(0)
+#    return isinstance(V.ufl_element(),
+#                      ufl.finiteelement.enrichedelement.EnrichedElement)
 
 
 def is_Expression(obj):
