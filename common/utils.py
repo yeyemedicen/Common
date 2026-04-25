@@ -4,39 +4,23 @@
 import git
 import os
 import shutil
-import dolfin
-#import ufl
-
-
-#def is_enriched(V):
-#    ''' Check if the given function space or sub function space has enriched
-#    elements. '''
-#
-#    # FIXME pybind11 hack for >=2018.1.0:
-#    if (dolfin.__version__ >= '2018'
-#            and isinstance(V, dolfin.cpp.function.FunctionSpace)):
-#        V = dolfin.FunctionSpace(V)
-#
-#    while V.num_sub_spaces():
-#        V = V.sub(0)
-#    return isinstance(V.ufl_element(),
-#                      ufl.finiteelement.enrichedelement.EnrichedElement)
 
 
 def is_Expression(obj):
-    ''' Check if object has type dolfin Expression '''
-    if dolfin.__version__ >= '2018':
-        return isinstance(obj, dolfin.function.expression.Expression)
-    else:
-        return isinstance(obj, dolfin.functions.expression.Expression)
+    ''' Check if object is a dolfinx fem.Function (replaces legacy Expression). '''
+    from dolfinx import fem
+    return isinstance(obj, fem.Function)
 
 
 def is_Constant(obj):
-    ''' Check if object has type dolfin Constant '''
-    if dolfin.__version__ >= '2018':
-        return isinstance(obj, dolfin.function.constant.Constant)
-    else:
-        return isinstance(obj, dolfin.functions.constant.Constant)
+    ''' Check if object is a dolfinx fem.Constant. '''
+    from dolfinx import fem
+    return isinstance(obj, fem.Constant)
+
+
+def is_enriched(V):
+    ''' Check if FunctionSpace V uses an enriched (P1b / bubble) element. '''
+    return hasattr(V.ufl_element(), '_elements')
 
 
 def on_cluster():

@@ -1,7 +1,31 @@
 ''' input/output module '''
 
 
-def read_HDF5_data(mpi_comm, h5file, fun, name):
+def read_HDF5_data(comm, h5file, fun, name):
+    ''' Read checkpoint data from an XDMF file into a dolfinx Function.
+
+    Args:
+        comm            MPI communicator (e.g. mesh.comm)
+        h5file (str)    Path to checkpoint file. If the extension is `.h5`
+                        the equivalent `.xdmf` file is used instead
+                        (legacy FEniCS .h5 checkpoint files are not directly
+                        readable by DOLFINx).
+        fun             dolfinx Function to read into
+        name (str)      Name of the dataset (used as the function name)
+
+    Returns:
+        time            Timestamp stored in the file, or 0 if none
+    '''
+    from dolfinx.io import XDMFFile
+
+    xdmf_file = h5file[:-3] + '.xdmf' if h5file.endswith('.h5') else h5file
+    time = 0.0
+    with XDMFFile(comm, xdmf_file, 'r') as xf:
+        xf.read_function(fun, name)
+    return time
+
+
+def old_read_HDF5_data(mpi_comm, h5file, fun, name):
     ''' Read checkpoint data from a HDF5 file into a dolfin function.
 
     Args:
@@ -24,23 +48,132 @@ def read_HDF5_data(mpi_comm, h5file, fun, name):
     return time
 
 
-def write_HDF5_data(mpi_comm, h5file, fun, name, t=0.):
-    ''' Write checkpoint data from a dolfin function into a HDF5 file for
-    reuse.
+def write_HDF5_data(comm, h5file, fun, name, t=0.):
+    ''' Write checkpoint data from a dolfinx Function into an XDMF file.
+
+    The output is written as a pair of files: `<stem>.xdmf` (XML header)
+    and `<stem>.h5` (binary data), which together form the DOLFINx XDMF
+    checkpoint format.
 
     Args:
-        h5file (str)    HDF5 File to be read from
-        mpi_comm        MPI comm, e.g. mesh.mpi_comm()
-        fun             Dolfin function
-        name (str)      name of the hdf5 dataset
+        comm            MPI communicator (e.g. mesh.comm)
+        h5file (str)    Output path. The `.h5` extension is replaced with
+                        `.xdmf` so that both the XDMF header and the HDF5
+                        data backend are written alongside each other.
+        fun             dolfinx Function to write
+        name (str)      Name of the dataset
+        t (float)       Timestamp
     '''
-    from dolfin import HDF5File
+    from dolfinx.io import XDMFFile
 
-    with HDF5File(mpi_comm, h5file, 'w') as hdf:
-        hdf.write(fun, name, float(t))
+    xdmf_file = h5file[:-3] + '.xdmf' if h5file.endswith('.h5') else h5file
+    with XDMFFile(comm, xdmf_file, 'w') as xf:
+        xf.write_function(fun, float(t))
 
 
 def read_mesh(mesh_file):
+    ''' Read mesh and boundary/subdomain tags for DOLFINx.
+
+    Supported format: XDMF (.xdmf).
+
+    The function expects either:
+    * A single XDMF file containing the mesh **and** meshtags stored under
+      the names ``"subdomains"`` and ``"boundaries"``, or
+    * A mesh XDMF file alongside ``<stem>_subdomains.xdmf`` and
+      ``<stem>_boundaries.xdmf`` companion files.
+
+    Legacy FEniCS `.h5` and `.xml` mesh files are **not** supported.
+    Convert them first::
+
+        python -m meshio convert mesh.h5 mesh.xdmf
+
+    Args:
+        mesh_file (str)   Path to the XDMF mesh file
+
+    Returns:
+        mesh              dolfinx.mesh.Mesh
+        subdomains        dolfinx.mesh.MeshTags for cell markers (or None)
+        boundaries        dolfinx.mesh.MeshTags for facet markers (or None)
+    '''
+    from mpi4py import MPI
+    from dolfinx.io import XDMFFile
+
+    tmp = mesh_file.split('.')
+    file_type = tmp[-1]
+    mesh_stem = '.'.join(tmp[:-1])
+
+    if file_type in ('h5', 'xml'):
+        raise NotImplementedError(
+            'Legacy FEniCS {} mesh format is not supported by DOLFINx. '
+            'Convert to XDMF first, e.g.:\n'
+            '  python -m meshio convert {} {}.xdmf'.format(
+                file_type, mesh_file, mesh_stem))
+
+    if file_type != 'xdmf':
+        raise Exception(
+            'Mesh format ".{}" not recognised. Use XDMF (.xdmf).'.format(
+                file_type))
+
+    # ── Read mesh ─────────────────────────────────────────────────────────────
+    mesh = None
+    for _mesh_name in ('Grid', 'mesh', 'Mesh'):
+        try:
+            with XDMFFile(MPI.COMM_WORLD, mesh_file, 'r') as xf:
+                mesh = xf.read_mesh(name=_mesh_name)
+            break
+        except Exception:
+            continue
+    if mesh is None:
+        raise RuntimeError(
+            'Could not read mesh from {}. Tried grid names: Grid, mesh, Mesh.'
+            .format(mesh_file))
+
+    # Connectivity needed before reading facet meshtags
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+
+    # ── Try reading tags from the same XDMF file first ────────────────────────
+    # Try multiple common naming conventions
+    _cell_names = ('subdomains', 'cells', 'Grid')
+    _facet_names = ('boundaries', 'facets', 'Grid')
+
+    subdomains = None
+    for _name in _cell_names:
+        subdomains = _try_read_meshtags(MPI.COMM_WORLD, mesh_file, mesh,
+                                        _name, mesh.topology.dim)
+        if subdomains is not None:
+            break
+
+    boundaries = None
+    for _name in _facet_names:
+        boundaries = _try_read_meshtags(MPI.COMM_WORLD, mesh_file, mesh,
+                                        _name, mesh.topology.dim - 1)
+        if boundaries is not None:
+            break
+
+    # ── Fall back to companion files if not found ──────────────────────────────
+    if subdomains is None:
+        companion = mesh_stem + '_subdomains.xdmf'
+        for _name in ('Grid', 'subdomains', 'cells'):
+            subdomains = _try_read_meshtags(MPI.COMM_WORLD, companion, mesh,
+                                            _name, mesh.topology.dim)
+            if subdomains is not None:
+                break
+
+    if boundaries is None:
+        companion = mesh_stem + '_boundaries.xdmf'
+        for _name in ('Grid', 'boundaries', 'facets'):
+            boundaries = _try_read_meshtags(MPI.COMM_WORLD, companion, mesh,
+                                            _name, mesh.topology.dim - 1)
+            if boundaries is not None:
+                break
+
+    if boundaries is None and MPI.COMM_WORLD.rank == 0:
+        print('Warning: no boundary tags found for mesh {}'.format(mesh_file))
+
+    return mesh, subdomains, boundaries
+
+
+def read_mesh_old(mesh_file):
     ''' Read HDF5 or DOLFIN XML mesh.
 
     Args:
@@ -121,9 +254,22 @@ def read_mesh(mesh_file):
                         ' deprecated)')
 
 
-# NOTE http://fenicsproject.org/qa/5337/importing-marked-mesh-for-parallel-use
-    # see file xml2xdmf.py
     return mesh, subdomains, boundaries
+
+
+def _try_read_meshtags(comm, xdmf_file, mesh, name, dim):
+    ''' Attempt to read meshtags from an XDMF file; return None on failure. '''
+    import os
+    from dolfinx.io import XDMFFile
+
+    if not os.path.isfile(xdmf_file):
+        return None
+    try:
+        with XDMFFile(comm, xdmf_file, 'r') as xf:
+            tags = xf.read_meshtags(mesh, name=name)
+        return tags
+    except Exception:
+        return None
 
 
 def read_parameters(infile):
@@ -146,7 +292,7 @@ def dump_parameters(prms):
     ''' Wrapper for yaml.dump (e.g., for logging.debug()) '''
     import ruamel.yaml as yaml
     import sys
-    yaa = yaml.YAML(typ='unsafe',pure=True)
+    yaa = yaml.YAML(typ='unsafe', pure=True)
     return yaa.dump(prms, sys.stdout)
 
 
