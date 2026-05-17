@@ -71,6 +71,21 @@ def write_HDF5_data(comm, h5file, fun, name, t=0.):
         xf.write_function(fun, float(t))
 
 
+def write_HDF5_data_old(mpi_comm, h5file, fun, name, t=0.):
+    ''' Write checkpoint data from a dolfin function into a HDF5 file for
+    reuse.
+
+    Args:
+        h5file (str)    HDF5 File to be read from
+        mpi_comm        MPI comm, e.g. mesh.mpi_comm()
+        fun             Dolfin function
+        name (str)      name of the hdf5 dataset
+    '''
+    from dolfin import HDF5File
+
+    with HDF5File(mpi_comm, h5file, 'w') as hdf:
+        hdf.write(fun, name, float(t))
+
 def read_mesh(mesh_file):
     ''' Read mesh and boundary/subdomain tags for DOLFINx.
 
@@ -184,7 +199,7 @@ def read_mesh_old(mesh_file):
         sd              subdomains
         bnd             boundaries
     '''
-    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile
+    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile, edges as _edges, vertices as _verts
     # pth = '/'.join(mesh_file.split('/')[0:-1])
     tmp = mesh_file.split('.')  # [-1].split('.')
     file_type = tmp[-1]
@@ -237,17 +252,55 @@ def read_mesh_old(mesh_file):
                         mesh_file))
 
     elif file_type == 'xdmf':
+        import os
+        import h5py as _h5py
 
         mesh = Mesh()
-
         with XDMFFile(mesh_file) as xf:
             xf.read(mesh)
-            subdomains = MeshFunction('size_t', mesh, mesh.topology().dim(), 0)
-            boundaries = MeshFunction('size_t', mesh, mesh.topology().dim()
-                                      - 1, 0)
 
-            xf.read(subdomains)
-            xf.read(boundaries)
+        # Build ALL connectivity tables (vertex↔edge needed for tag lookup).
+        mesh.init()
+
+        subdomains = MeshFunction('size_t', mesh, mesh.topology().dim(), 0)
+        boundaries = MeshFunction('size_t', mesh, mesh.topology().dim() - 1, 0)
+
+        # ── Read boundary tags from HDF5 directly ─────────────────────────────
+        # dolfin's XDMFFile.read(MeshFunction) is unreliable with externally
+        # written XDMF (state corruption, Precision mismatches, …).  Instead
+        # we read the topology (edge vertex-pairs) and values straight from
+        # the companion .h5 file, then populate the MeshFunction ourselves
+        # using dolfin's vertex-to-edge connectivity table.
+        h5_file = mesh_pref + '.h5'
+        if os.path.isfile(h5_file):
+            try:
+                with _h5py.File(h5_file, 'r') as hf:
+                    bnd_topo = hf['boundaries/topology'][()]   # (N_bnd, 2)
+                    bnd_vals = hf['boundaries/values'][()]     # (N_bnd,)
+
+                # Build vertex → edge-index map from dolfin's own iterators.
+                # mesh.topology()(0,1) is unreliable across dolfin versions;
+                # iterating edges() is always correct.
+                mesh.init(1)   # ensure edge entities are created
+                v2e = {}
+                for e in _edges(mesh):
+                    for v in _verts(e):
+                        v2e.setdefault(v.index(), []).append(e.index())
+
+                n_set = 0
+                for (v0, v1), tag in zip(bnd_topo, bnd_vals):
+                    shared = set(v2e.get(int(v0), [])) & set(v2e.get(int(v1), []))
+                    if shared:
+                        boundaries[shared.pop()] = int(tag)
+                        n_set += 1
+
+                import numpy as _np
+                unique_tags = _np.unique(boundaries.array())
+                print('Boundary tags loaded: {} / {} edges tagged  |  tags: {}'.format(
+                    n_set, len(bnd_vals), unique_tags.tolist()))
+            except Exception as e:
+                print('Warning: could not read boundary tags from {}: {}'.format(
+                    h5_file, e))
 
     else:
         raise Exception('Mesh format not recognized. Try XDMF or HDF5 (or XML,'
