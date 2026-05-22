@@ -199,7 +199,7 @@ def read_mesh_old(mesh_file):
         sd              subdomains
         bnd             boundaries
     '''
-    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile, edges as _edges, vertices as _verts
+    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile, cells as _cells, edges as _edges, vertices as _verts
     # pth = '/'.join(mesh_file.split('/')[0:-1])
     tmp = mesh_file.split('.')  # [-1].split('.')
     file_type = tmp[-1]
@@ -254,49 +254,73 @@ def read_mesh_old(mesh_file):
     elif file_type == 'xdmf':
         import os
         import h5py as _h5py
+        import numpy as _np
 
         mesh = Mesh()
         with XDMFFile(mesh_file) as xf:
             xf.read(mesh)
 
-        # Build ALL connectivity tables (vertex↔edge needed for tag lookup).
+        # Build ALL connectivity tables.
         mesh.init()
 
         subdomains = MeshFunction('size_t', mesh, mesh.topology().dim(), 0)
+        # boundaries dimension is resolved below after inspecting the h5 topology
         boundaries = MeshFunction('size_t', mesh, mesh.topology().dim() - 1, 0)
 
         # ── Read boundary tags from HDF5 directly ─────────────────────────────
         # dolfin's XDMFFile.read(MeshFunction) is unreliable with externally
-        # written XDMF (state corruption, Precision mismatches, …).  Instead
-        # we read the topology (edge vertex-pairs) and values straight from
-        # the companion .h5 file, then populate the MeshFunction ourselves
-        # using dolfin's vertex-to-edge connectivity table.
+        # written XDMF.  Instead we read topology/values from the companion .h5
+        # and populate the MeshFunction via dolfin's connectivity iterators.
+        #
+        # 2-D flat mesh  → boundary entities are edges  (2 nodes each, dim-1=1)
+        # 3-D surface mesh → boundary regions are cells (3 nodes each, dim  =2)
         h5_file = mesh_pref + '.h5'
         if os.path.isfile(h5_file):
             try:
                 with _h5py.File(h5_file, 'r') as hf:
-                    bnd_topo = hf['boundaries/topology'][()]   # (N_bnd, 2)
-                    bnd_vals = hf['boundaries/values'][()]     # (N_bnd,)
+                    bnd_topo = hf['boundaries/topology'][()]  # (N, 2) or (N, 3)
+                    bnd_vals = hf['boundaries/values'][()]    # (N,)
 
-                # Build vertex → edge-index map from dolfin's own iterators.
-                # mesh.topology()(0,1) is unreliable across dolfin versions;
-                # iterating edges() is always correct.
-                mesh.init(1)   # ensure edge entities are created
-                v2e = {}
-                for e in _edges(mesh):
-                    for v in _verts(e):
-                        v2e.setdefault(v.index(), []).append(e.index())
+                n_nodes = bnd_topo.shape[1]
 
-                n_set = 0
-                for (v0, v1), tag in zip(bnd_topo, bnd_vals):
-                    shared = set(v2e.get(int(v0), [])) & set(v2e.get(int(v1), []))
-                    if shared:
-                        boundaries[shared.pop()] = int(tag)
-                        n_set += 1
+                if n_nodes == 2:
+                    # 2-D mesh: boundaries are edges (facets, dim=1)
+                    mesh.init(1)
+                    v2e = {}
+                    for e in _edges(mesh):
+                        for v in _verts(e):
+                            v2e.setdefault(v.index(), []).append(e.index())
 
-                import numpy as _np
+                    n_set = 0
+                    for (v0, v1), tag in zip(bnd_topo, bnd_vals):
+                        shared = set(v2e.get(int(v0), [])) & set(v2e.get(int(v1), []))
+                        if shared:
+                            boundaries[shared.pop()] = int(tag)
+                            n_set += 1
+
+                elif n_nodes == 3:
+                    # 3-D surface mesh: boundary regions are marked on triangle
+                    # cells (same dimension as the mesh cells).  Re-declare the
+                    # MeshFunction on dim instead of dim-1.
+                    boundaries = MeshFunction('size_t', mesh, mesh.topology().dim(), 0)
+
+                    v2c = {}
+                    for c in _cells(mesh):
+                        for v in _verts(c):
+                            v2c.setdefault(v.index(), set()).add(c.index())
+
+                    n_set = 0
+                    for tri, tag in zip(bnd_topo, bnd_vals):
+                        v0, v1, v2_idx = int(tri[0]), int(tri[1]), int(tri[2])
+                        shared = (v2c.get(v0, set()) &
+                                  v2c.get(v1, set()) &
+                                  v2c.get(v2_idx, set()))
+                        if shared:
+                            boundaries[shared.pop()] = int(tag)
+                            n_set += 1
+
                 unique_tags = _np.unique(boundaries.array())
-                print('Boundary tags loaded: {} / {} edges tagged  |  tags: {}'.format(
+                print('Boundary tags loaded: {} / {} entities tagged  |  tags: {}'.format(
                     n_set, len(bnd_vals), unique_tags.tolist()))
             except Exception as e:
                 print('Warning: could not read boundary tags from {}: {}'.format(
