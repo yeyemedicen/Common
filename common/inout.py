@@ -199,7 +199,7 @@ def read_mesh_old(mesh_file):
         sd              subdomains
         bnd             boundaries
     '''
-    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile, cells as _cells, edges as _edges, faces as _faces, vertices as _verts
+    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile
     # pth = '/'.join(mesh_file.split('/')[0:-1])
     tmp = mesh_file.split('.')  # [-1].split('.')
     file_type = tmp[-1]
@@ -253,76 +253,31 @@ def read_mesh_old(mesh_file):
 
     elif file_type == 'xdmf':
         import os
-        import h5py as _h5py
-        import numpy as _np
+        from dolfin import MeshValueCollection
 
         mesh = Mesh()
-        with XDMFFile(mesh_file) as xf:
+        with XDMFFile(mesh.mpi_comm(), mesh_file) as xf:
             xf.read(mesh)
 
-        # Build ALL connectivity tables.
         mesh.init()
 
-        subdomains = MeshFunction('size_t', mesh, mesh.topology().dim(), 0)
-        # boundaries dimension is resolved below after inspecting the h5 topology
-        boundaries = MeshFunction('size_t', mesh, mesh.topology().dim() - 1, 0)
+        dim = mesh.topology().dim()
+        subdomains = MeshFunction('size_t', mesh, dim, 0)
+        boundaries = MeshFunction('size_t', mesh, dim - 1, 0)
 
-        # ── Read boundary tags from HDF5 directly ─────────────────────────────
-        # dolfin's XDMFFile.read(MeshFunction) is unreliable with externally
-        # written XDMF.  Instead we read topology/values from the companion .h5
-        # and populate the MeshFunction via dolfin's connectivity iterators.
-        #
-        # 2-D flat mesh → boundary entities are edges   (2 nodes each, dim-1=1)
-        # 3-D volume mesh → boundary entities are faces (3 nodes each, dim-1=2)
-        h5_file = mesh_pref + '.h5'
-        if os.path.isfile(h5_file):
+        bnd_companion = mesh_pref + '_boundaries.xdmf'
+        if os.path.isfile(bnd_companion):
             try:
-                with _h5py.File(h5_file, 'r') as hf:
-                    bnd_topo = hf['boundaries/topology'][()]  # (N, 2) or (N, 3)
-                    bnd_vals = hf['boundaries/values'][()]    # (N,)
-
-                n_nodes = bnd_topo.shape[1]
-
-                if n_nodes == 2:
-                    # 2-D mesh: boundaries are edges (facets, dim=1)
-                    mesh.init(1)
-                    v2e = {}
-                    for e in _edges(mesh):
-                        for v in _verts(e):
-                            v2e.setdefault(v.index(), []).append(e.index())
-
-                    n_set = 0
-                    for (v0, v1), tag in zip(bnd_topo, bnd_vals):
-                        shared = set(v2e.get(int(v0), [])) & set(v2e.get(int(v1), []))
-                        if shared:
-                            boundaries[shared.pop()] = int(tag)
-                            n_set += 1
-
-                elif n_nodes == 3:
-                    # 3-D mesh: boundary entities are triangular facets (dim-1=2).
-                    # boundaries is already declared at dim-1 — do NOT re-declare it
-                    # on dim (cells); that would break ds() integrals in FEniCS.
-                    v2f = {}
-                    for fa in _faces(mesh):
-                        for v in _verts(fa):
-                            v2f.setdefault(v.index(), set()).add(fa.index())
-
-                    n_set = 0
-                    for tri, tag in zip(bnd_topo, bnd_vals):
-                        v0, v1, v2_idx = int(tri[0]), int(tri[1]), int(tri[2])
-                        shared = (v2f.get(v0, set()) &
-                                  v2f.get(v1, set()) &
-                                  v2f.get(v2_idx, set()))
-                        if shared:
-                            boundaries[shared.pop()] = int(tag)
-                            n_set += 1
-
-                unique_tags = _np.unique(boundaries.array())
-                print('Boundary tags loaded: {} / {} entities tagged  |  tags: {}'.format(
-                    n_set, len(bnd_vals), unique_tags.tolist()))
+                mvc = MeshValueCollection('size_t', mesh, dim - 1)
+                with XDMFFile(mesh.mpi_comm(), bnd_companion) as xf:
+                    xf.read(mvc, 'boundaries')
+                boundaries = MeshFunction('size_t', mesh, mvc)
             except Exception as e:
-                print('Warning: could not read boundary tags from {}: {}'.format(
-                    h5_file, e))
+                if mesh.mpi_comm().rank == 0:
+                    print('Warning: could not read boundaries from {}: {}'.format(
+                        bnd_companion, e))
+        elif mesh.mpi_comm().rank == 0:
+            print('Warning: no boundary file found ({})'.format(bnd_companion))
 
     else:
         raise Exception('Mesh format not recognized. Try XDMF or HDF5 (or XML,'
