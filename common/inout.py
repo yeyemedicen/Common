@@ -199,7 +199,7 @@ def read_mesh_old(mesh_file):
         sd              subdomains
         bnd             boundaries
     '''
-    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile, cells as _cells, edges as _edges, vertices as _verts
+    from dolfin import Mesh, MeshFunction, HDF5File, XDMFFile, cells as _cells, edges as _edges, faces as _faces, vertices as _verts
     # pth = '/'.join(mesh_file.split('/')[0:-1])
     tmp = mesh_file.split('.')  # [-1].split('.')
     file_type = tmp[-1]
@@ -272,8 +272,8 @@ def read_mesh_old(mesh_file):
         # written XDMF.  Instead we read topology/values from the companion .h5
         # and populate the MeshFunction via dolfin's connectivity iterators.
         #
-        # 2-D flat mesh  → boundary entities are edges  (2 nodes each, dim-1=1)
-        # 3-D surface mesh → boundary regions are cells (3 nodes each, dim  =2)
+        # 2-D flat mesh → boundary entities are edges   (2 nodes each, dim-1=1)
+        # 3-D volume mesh → boundary entities are faces (3 nodes each, dim-1=2)
         h5_file = mesh_pref + '.h5'
         if os.path.isfile(h5_file):
             try:
@@ -299,22 +299,20 @@ def read_mesh_old(mesh_file):
                             n_set += 1
 
                 elif n_nodes == 3:
-                    # 3-D surface mesh: boundary regions are marked on triangle
-                    # cells (same dimension as the mesh cells).  Re-declare the
-                    # MeshFunction on dim instead of dim-1.
-                    boundaries = MeshFunction('size_t', mesh, mesh.topology().dim(), 0)
-
-                    v2c = {}
-                    for c in _cells(mesh):
-                        for v in _verts(c):
-                            v2c.setdefault(v.index(), set()).add(c.index())
+                    # 3-D mesh: boundary entities are triangular facets (dim-1=2).
+                    # boundaries is already declared at dim-1 — do NOT re-declare it
+                    # on dim (cells); that would break ds() integrals in FEniCS.
+                    v2f = {}
+                    for fa in _faces(mesh):
+                        for v in _verts(fa):
+                            v2f.setdefault(v.index(), set()).add(fa.index())
 
                     n_set = 0
                     for tri, tag in zip(bnd_topo, bnd_vals):
                         v0, v1, v2_idx = int(tri[0]), int(tri[1]), int(tri[2])
-                        shared = (v2c.get(v0, set()) &
-                                  v2c.get(v1, set()) &
-                                  v2c.get(v2_idx, set()))
+                        shared = (v2f.get(v0, set()) &
+                                  v2f.get(v1, set()) &
+                                  v2f.get(v2_idx, set()))
                         if shared:
                             boundaries[shared.pop()] = int(tag)
                             n_set += 1
@@ -329,7 +327,6 @@ def read_mesh_old(mesh_file):
     else:
         raise Exception('Mesh format not recognized. Try XDMF or HDF5 (or XML,'
                         ' deprecated)')
-
 
     return mesh, subdomains, boundaries
 
