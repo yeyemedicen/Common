@@ -253,6 +253,7 @@ def read_mesh_old(mesh_file):
 
     elif file_type == 'xdmf':
         import os
+        import h5py as _h5py
         from dolfin import MPI as _dMPI, MeshValueCollection
 
         _comm      = _dMPI.comm_world
@@ -261,6 +262,21 @@ def read_mesh_old(mesh_file):
         _parallel  = (_comm.size > 1)
 
         bnd_companion = mesh_pref + '_boundaries.xdmf'
+        _bnd_h5       = mesh_pref + '.h5'
+
+        # Detect whether boundary entities are cell-level (same dim as mesh
+        # cells, e.g. triangle patches on a surface mesh) or facet-level (one
+        # dim lower, e.g. edge labels on a 2-D mesh).
+        # Cell labels → read into subdomains / use dx(tag).
+        # Facet labels → read into boundaries / use ds(tag).
+        _bnd_is_cell = False
+        if os.path.isfile(_bnd_h5):
+            with _h5py.File(_bnd_h5, 'r') as _hf:
+                if 'boundaries/topology' in _hf and 'mesh/topology' in _hf:
+                    _bnd_is_cell = (
+                        _hf['boundaries/topology'].shape[1]
+                        == _hf['mesh/topology'].shape[1]
+                    )
 
         if not _parallel:
             # ── Serial path: read XDMF directly ───────────────────────────────
@@ -274,13 +290,22 @@ def read_mesh_old(mesh_file):
 
             if os.path.isfile(bnd_companion):
                 try:
-                    mvc = MeshValueCollection('size_t', mesh, dim - 1)
-                    with XDMFFile(_comm, bnd_companion) as xf:
-                        xf.read(mvc, 'boundaries')
-                    mesh.init(dim, dim - 1)
-                    c2f = mesh.topology()(dim, dim - 1)
-                    for (cell_idx, local_idx), val in mvc.values().items():
-                        boundaries[c2f(cell_idx)[local_idx]] = val
+                    if _bnd_is_cell:
+                        # Triangle patches → cell labels → subdomains
+                        mvc = MeshValueCollection('size_t', mesh, dim)
+                        with XDMFFile(_comm, bnd_companion) as xf:
+                            xf.read(mvc, 'boundaries')
+                        for (cell_idx, _li), val in mvc.values().items():
+                            subdomains[cell_idx] = val
+                    else:
+                        # Edge labels → facet labels → boundaries
+                        mvc = MeshValueCollection('size_t', mesh, dim - 1)
+                        with XDMFFile(_comm, bnd_companion) as xf:
+                            xf.read(mvc, 'boundaries')
+                        mesh.init(dim, dim - 1)
+                        c2f = mesh.topology()(dim, dim - 1)
+                        for (cell_idx, local_idx), val in mvc.values().items():
+                            boundaries[c2f(cell_idx)[local_idx]] = val
                 except Exception as e:
                     print('Warning: could not read boundaries from {}: {}'.format(
                         bnd_companion, e))
@@ -289,46 +314,85 @@ def read_mesh_old(mesh_file):
 
         else:
             # ── Parallel path ─────────────────────────────────────────────────
-            # dolfin 2019.x XDMFFile parallel reading goes through a mpi4py
-            # communicator conversion that is broken on Mac conda installs with
-            # an MPI ABI mismatch (MPI.Session struct size 32 vs 40).  The
-            # broken conversion causes the mesh partitioner to silently drop
-            # ~40 % of the mesh vertices, producing a matrix smaller than V.dim().
-            # HDF5File uses a different code path that is NOT affected.
+            # dolfin 2019.x XDMFFile.read() calls a global MPI collective
+            # internally even when passed comm_self, so it cannot be called on
+            # only one rank of a multi-rank job — the other ranks never
+            # participate and the collective deadlocks.
             #
-            # Workaround: rank 0 reads the XDMF serially, writes a temporary
-            # dolfin-format HDF5 (mesh + boundary tags), then all processes read
-            # that HDF5 in parallel with HDF5File (which works correctly).
+            # Fix: rank 0 launches a fresh single-process subprocess (no MPI
+            # context) that reads the XDMF and writes a proper dolfin-format
+            # HDF5 temp file.  HDF5File parallel reading (used by all ranks
+            # below) is unaffected by the MPI ABI mismatch and works correctly.
+            import subprocess as _subp
+            import sys as _sys
+            import textwrap as _tw
+
             tmp_h5 = mesh_pref + '_parallel_tmp.h5'
 
             if _rank == 0:
-                _mesh_tmp = Mesh()
-                with XDMFFile(_comm_self, mesh_file) as xf:
-                    xf.read(_mesh_tmp)
+                _script = _tw.dedent("""\
+                    from dolfin import (Mesh, XDMFFile, MeshFunction,
+                                        MeshValueCollection, HDF5File, MPI as dMPI)
+                    import os, sys
+                    comm_self    = dMPI.comm_self
+                    mesh_file    = sys.argv[1]
+                    bnd_companion= sys.argv[2]
+                    tmp_h5       = sys.argv[3]
+                    bnd_is_cell  = sys.argv[4] == '1'
 
-                _dim = _mesh_tmp.topology().dim()
-                _bnd_tmp = MeshFunction('size_t', _mesh_tmp, _dim - 1, 0)
+                    m = Mesh()
+                    with XDMFFile(comm_self, mesh_file) as xf:
+                        xf.read(m)
+                    dim = m.topology().dim()
+                    sub = MeshFunction('size_t', m, dim, 0)
+                    bnd = MeshFunction('size_t', m, dim - 1, 0)
+                    if os.path.isfile(bnd_companion):
+                        try:
+                            if bnd_is_cell:
+                                mvc = MeshValueCollection('size_t', m, dim)
+                                with XDMFFile(comm_self, bnd_companion) as xf:
+                                    xf.read(mvc, 'boundaries')
+                                for (ci, _li), val in mvc.values().items():
+                                    sub[ci] = val
+                            else:
+                                mvc = MeshValueCollection('size_t', m, dim - 1)
+                                with XDMFFile(comm_self, bnd_companion) as xf:
+                                    xf.read(mvc, 'boundaries')
+                                m.init(dim, dim - 1)
+                                c2f = m.topology()(dim, dim - 1)
+                                for (ci, li), val in mvc.values().items():
+                                    bnd[c2f(ci)[li]] = val
+                        except Exception as e:
+                            print('Warning: could not read boundaries:', e)
+                    else:
+                        print('Warning: no boundary file found:', bnd_companion)
+                    with HDF5File(comm_self, tmp_h5, 'w') as hdf:
+                        hdf.write(m, '/mesh')
+                        hdf.write(sub, '/subdomains')
+                        hdf.write(bnd, '/boundaries')
+                """)
+                # Strip MPI environment variables so the subprocess starts as a
+                # plain serial Python process — without this, dolfin/mpi4py
+                # detects PMI_FD and re-joins the MPI job, causing the same
+                # XDMFFile collective deadlock inside the subprocess.
+                import os as _os
+                _env = {k: v for k, v in _os.environ.items()
+                        if not any(k.startswith(_p) for _p in (
+                            'PMI_', 'MPI_', 'OMPI_', 'MPICH_', 'PMIX_',
+                            'HYDRA_', 'PRTE_', 'PRRTE_', 'ORTED_',
+                            'ORTE_', 'MPIEXEC_', 'I_MPI_'))}
+                _result = _subp.run(
+                    [_sys.executable, '-c', _script,
+                     mesh_file, bnd_companion, tmp_h5,
+                     '1' if _bnd_is_cell else '0'],
+                    capture_output=True, text=True, env=_env)
+                if _result.returncode != 0:
+                    raise RuntimeError(
+                        'XDMF→HDF5 conversion subprocess failed:\n' +
+                        _result.stderr)
+                if _result.stderr:
+                    print(_result.stderr, end='')
 
-                if os.path.isfile(bnd_companion):
-                    try:
-                        _mvc = MeshValueCollection('size_t', _mesh_tmp, _dim - 1)
-                        with XDMFFile(_comm_self, bnd_companion) as xf:
-                            xf.read(_mvc, 'boundaries')
-                        _mesh_tmp.init(_dim, _dim - 1)
-                        _c2f = _mesh_tmp.topology()(_dim, _dim - 1)
-                        for (_ci, _li), _val in _mvc.values().items():
-                            _bnd_tmp[_c2f(_ci)[_li]] = _val
-                    except Exception as e:
-                        print('Warning: could not read boundaries from {}: {}'.format(
-                            bnd_companion, e))
-                else:
-                    print('Warning: no boundary file found ({})'.format(bnd_companion))
-
-                with HDF5File(_comm_self, tmp_h5, 'w') as _hdf:
-                    _hdf.write(_mesh_tmp, '/mesh')
-                    _hdf.write(_bnd_tmp,  '/boundaries')
-
-            # All processes wait until rank 0 has written the temp file
             _dMPI.barrier(_comm)
 
             mesh = Mesh()
@@ -337,6 +401,8 @@ def read_mesh_old(mesh_file):
                 dim = mesh.topology().dim()
                 subdomains = MeshFunction('size_t', mesh, dim, 0)
                 boundaries = MeshFunction('size_t', mesh, dim - 1, 0)
+                if hdf.has_dataset('subdomains'):
+                    hdf.read(subdomains, '/subdomains')
                 if hdf.has_dataset('boundaries'):
                     hdf.read(boundaries, '/boundaries')
 
@@ -346,7 +412,6 @@ def read_mesh_old(mesh_file):
     else:
         raise Exception('Mesh format not recognized. Try XDMF or HDF5 (or XML,'
                         ' deprecated)')
-
 
     return mesh, subdomains, boundaries
 
